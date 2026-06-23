@@ -242,23 +242,54 @@ def read_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None:
     return _search_countdown_in_page(page)
 
 
-def read_brick_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None:
-    """读取砖场倒计时，多重降级"""
-    # 方法 1：从 #brickStatus 读取文本
+def is_brick_available(page, *, timeout_ms: int = 10000) -> bool:
+    """
+    判断砖场是否可用（可以搬砖）。
+    根据 #brickStatus 文本判断：
+    - 包含 "可以搬砖" → True（立即可用）
+    - 包含倒计时 → 还在冷却
+    - 其他/未找到 → False
+    """
     try:
         status_el = page.locator(SEL_BRICK_STATUS_AREA)
         status_el.wait_for(state="attached", timeout=timeout_ms)
         text = status_el.inner_text(timeout=3000)
-        seconds = parse_countdown_text(text)
+        text_stripped = text.strip()
+        if "可以搬砖" in text_stripped:
+            log(f"[brick status] ✅ 砖场可用，text='{text_stripped}'")
+            return True
+        seconds = parse_countdown_text(text_stripped)
         if seconds is not None:
-            log(f"[brick status] brickStatus text='{text.strip()}' => {seconds}s")
-            return seconds
-        else:
-            log(f"[brick status] no countdown in brickStatus, text='{text.strip()}'")
+            log(f"[brick status] 砖场冷却中，text='{text_stripped}' => {seconds}s")
+            return False
+        log(f"[brick status] 未知状态，text='{text_stripped}'")
+        return False
     except PlaywrightTimeoutError:
         log("[brick status] #brickStatus not found within timeout")
     except Exception as e:
-        log(f"[brick status] #brickStatus read err: {e}")
+        log(f"[brick status] read err: {e}")
+    return False
+
+
+def read_brick_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None:
+    """读取砖场倒计时秒数。如果砖场可用（可以搬砖），返回 0。"""
+    try:
+        status_el = page.locator(SEL_BRICK_STATUS_AREA)
+        status_el.wait_for(state="attached", timeout=timeout_ms)
+        text = status_el.inner_text(timeout=3000)
+        text_stripped = text.strip()
+        if "可以搬砖" in text_stripped:
+            log(f"[brick status] ✅ 砖场可用，返回 0，text='{text_stripped}'")
+            return 0
+        seconds = parse_countdown_text(text_stripped)
+        if seconds is not None:
+            log(f"[brick status] countdown='{text_stripped}' => {seconds}s")
+            return seconds
+        log(f"[brick status] no countdown in brickStatus, text='{text_stripped}'")
+    except PlaywrightTimeoutError:
+        log("[brick status] #brickStatus not found within timeout")
+    except Exception as e:
+        log(f"[brick status] read err: {e}")
 
     # 方法 2：尝试 .countdown 子元素（可能页面更新后出现）
     try:
@@ -266,13 +297,15 @@ def read_brick_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None
         if countdown.count() > 0:
             text = countdown.inner_text(timeout=3000)
             seconds = parse_countdown_text(text)
-            log(f"[brick status] .countdown text='{text.strip()}' => {seconds}s")
-            return seconds
+            if seconds is not None:
+                log(f"[brick status] .countdown text='{text.strip()}' => {seconds}s")
+                return seconds
     except Exception as e:
         log(f"[brick status] .countdown read err: {e}")
 
-    # 方法 3：全文搜索兜底（跳过第一个倒计时，那是沙滩的）
-    return _search_countdown_in_page(page, skip_first=True)
+    # 不再全文搜索兜底——页面上其他倒计时（如全站Free）会干扰
+    log("[brick status] 无法确定砖场状态，返回 None")
+    return None
 
 
 def wait_for_brick_factory_ready(page, timeout_sec: int = 30) -> bool:
