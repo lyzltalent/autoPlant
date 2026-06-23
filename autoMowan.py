@@ -5,17 +5,20 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo  # Python 3.9+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 # 固定为新加坡时间；如果想用本机时区，去掉 ZoneInfo(...)
 TZ = ZoneInfo("Asia/Singapore")
 
 t0 = time.perf_counter()
+
+
 def _ts():
-    # 形如 2025-10-17 14:03:12.123
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
+
 def _dt():
-    # 自程序起点的相对耗时
     return f"+{int((time.perf_counter() - t0)*1000)}ms"
+
 
 def log(msg: str):
     print(f"[{_ts()} {_dt()}] {msg}", flush=True)
@@ -54,11 +57,10 @@ MIN_WAIT_AFTER_CHECK_SEC = 30
 # ====== 页面元素选择器（按页面实际改）======
 SEL_CLEAN_BTN = "#beachBtn"
 SEL_BEACH_AREA = "#beachArea"
-SEL_DROP_ITEMS = "#beachArea > *"  # 若掉落物不是直接子节点，换成更具体如 "#beachArea .drop-item"
-SEL_STATUS_COUNTDOWN = "#beachStatus .countdown"
+SEL_DROP_ITEMS = "#beachArea > *"
+SEL_STATUS_AREA = "#beachStatus"
 SEL_BRICK_FACTORY = "#brickFactory"
-SEL_BRICK_STATUS_COUNTDOWN = "#brickStatus .countdown"
-
+SEL_BRICK_STATUS_AREA = "#brickStatus"
 
 COUNTDOWN_RE = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})")
 
@@ -146,14 +148,13 @@ def click_clean_button(page):
 
 def click_drops(page):
     items = page.locator(SEL_DROP_ITEMS)
-    # 等到容器里至少出现目标数量，或网络空闲/短暂稳定
     try:
         page.wait_for_load_state("networkidle", timeout=5_000)
     except PlaywrightTimeoutError:
         log("[drops] wait_for_load_state timeout, continue anyway")
     except Exception as e:
         log(f"[drops] wait_for_load_state err: {e}")
-    page.wait_for_timeout(200)  # 给 DOM 合并一口气
+    page.wait_for_timeout(200)
     try:
         count = items.count()
     except Exception:
@@ -163,10 +164,8 @@ def click_drops(page):
         return
 
     for i in range(count):
-        # el = items.nth(i)
         el = items.first
         try:
-            # 先取文本，避免点击后元素消失拿不到
             txt = el.inner_text(timeout=500)
         except Exception:
             txt = ''
@@ -188,38 +187,92 @@ def click_drops(page):
         page.wait_for_timeout(ITEM_CLICK_INTERVAL_MS)
 
 
-def read_countdown_seconds(page, *, timeout_ms: int = 5000) -> int | None:
+# ── 从页面全文搜索倒计时的兜底函数 ──
+def _search_countdown_in_page(page, *, skip_first: bool = False) -> int | None:
+    """
+    从整个页面文本中搜索 HH:MM:SS 格式的倒计时。
+    skip_first=True 时跳过第一个匹配（用于砖场，跳过沙滩的倒计时）。
+    """
     try:
-        countdown = page.locator(SEL_STATUS_COUNTDOWN)
-        countdown.wait_for(state="attached", timeout=timeout_ms)
-        text = countdown.inner_text(timeout=timeout_ms)
-        seconds = parse_countdown_text(text)
-        log(
-            f"[status] countdown text='{text.strip() if text else text}' => {seconds if seconds is not None else 'unknown'} seconds"
-        )
-        return seconds
-    except PlaywrightTimeoutError:
-        log("[status] countdown locator timeout")
+        body_text = page.locator("body").inner_text(timeout=5000)
+        matches = COUNTDOWN_RE.findall(body_text)
+        if matches:
+            idx = 1 if skip_first and len(matches) >= 2 else 0
+            if idx < len(matches):
+                h, m, s = map(int, matches[idx])
+                seconds = h * 3600 + m * 60 + s
+                tag = "2nd" if skip_first else "1st"
+                log(f"[fallback] found {tag} countdown in page text: {h:02d}:{m:02d}:{s:02d} => {seconds}s")
+                return seconds
     except Exception as e:
-        log(f"[status] countdown read err: {e}")
+        log(f"[fallback] page text search err: {e}")
     return None
 
 
-def read_brick_countdown_seconds(page, *, timeout_ms: int = 5000) -> int | None:
+def read_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None:
+    """读取沙滩清理倒计时，多重降级"""
+    # 方法 1：读 #beachStatus 整个容器的文本（不依赖 .countdown 子元素）
     try:
-        countdown = page.locator(SEL_BRICK_STATUS_COUNTDOWN)
-        countdown.wait_for(state="attached", timeout=timeout_ms)
-        text = countdown.inner_text(timeout=timeout_ms)
+        status_el = page.locator(SEL_STATUS_AREA)
+        status_el.wait_for(state="attached", timeout=timeout_ms)
+        text = status_el.inner_text(timeout=3000)
         seconds = parse_countdown_text(text)
-        log(
-            f"[brick status] countdown='{text.strip() if text else text}' => {seconds if seconds is not None else 'unknown'} seconds"
-        )
-        return seconds
+        if seconds is not None:
+            log(f"[status] beachStatus text='{text.strip()}' => {seconds}s")
+            return seconds
+        else:
+            log(f"[status] no countdown in beachStatus, text='{text.strip()}'")
     except PlaywrightTimeoutError:
-        log("[brick status] countdown locator timeout")
+        log("[status] #beachStatus not found within timeout")
     except Exception as e:
-        log(f"[brick status] countdown read err: {e}")
-    return None
+        log(f"[status] #beachStatus read err: {e}")
+
+    # 方法 2：尝试 .countdown 子元素
+    try:
+        countdown = page.locator(f"{SEL_STATUS_AREA} .countdown")
+        if countdown.count() > 0:
+            text = countdown.inner_text(timeout=3000)
+            seconds = parse_countdown_text(text)
+            log(f"[status] .countdown text='{text.strip()}' => {seconds}s")
+            return seconds
+    except Exception as e:
+        log(f"[status] .countdown read err: {e}")
+
+    # 方法 3：全文搜索兜底
+    return _search_countdown_in_page(page)
+
+
+def read_brick_countdown_seconds(page, *, timeout_ms: int = 10000) -> int | None:
+    """读取砖场倒计时，多重降级"""
+    # 方法 1：从 #brickStatus 读取文本
+    try:
+        status_el = page.locator(SEL_BRICK_STATUS_AREA)
+        status_el.wait_for(state="attached", timeout=timeout_ms)
+        text = status_el.inner_text(timeout=3000)
+        seconds = parse_countdown_text(text)
+        if seconds is not None:
+            log(f"[brick status] brickStatus text='{text.strip()}' => {seconds}s")
+            return seconds
+        else:
+            log(f"[brick status] no countdown in brickStatus, text='{text.strip()}'")
+    except PlaywrightTimeoutError:
+        log("[brick status] #brickStatus not found within timeout")
+    except Exception as e:
+        log(f"[brick status] #brickStatus read err: {e}")
+
+    # 方法 2：尝试 .countdown 子元素（可能页面更新后出现）
+    try:
+        countdown = page.locator(f"{SEL_BRICK_STATUS_AREA} .countdown")
+        if countdown.count() > 0:
+            text = countdown.inner_text(timeout=3000)
+            seconds = parse_countdown_text(text)
+            log(f"[brick status] .countdown text='{text.strip()}' => {seconds}s")
+            return seconds
+    except Exception as e:
+        log(f"[brick status] .countdown read err: {e}")
+
+    # 方法 3：全文搜索兜底（跳过第一个倒计时，那是沙滩的）
+    return _search_countdown_in_page(page, skip_first=True)
 
 
 def wait_for_brick_factory_ready(page, timeout_sec: int = 30) -> bool:
@@ -298,7 +351,6 @@ def run_loop(page, *, max_runtime_sec: int | None = None):
             click_drops(page)
             page.wait_for_timeout(CHECK_INTERVAL_MS)
 
-            # 如果被踢回登录或路由跳走，尝试回到目标页
             if not page.url.startswith(URL):
                 log("[watchdog] url changed, navigating back...")
                 open_target(page)
