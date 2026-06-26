@@ -56,11 +56,6 @@ OVERRIDE_CONFIRM = True         # 若页面使用原生 window.confirm，置 Tru
 
 # ====== 出售配置 ======
 SELL_AFTER_HARVEST = True        # 收获后自动出售背包全部作物
-SELL_CONFIRM_BTNS = [
-    "button:has-text('确认')",
-    "button:has-text('确定')",
-    "button:has-text('出售')",
-]
 
 
 # ====== 通用 ======
@@ -205,24 +200,45 @@ def sell_one_crop(page, seed_id: int, quantity: int = None):
         return 0
 
     try:
-        # 填入数量
-        input_el.fill(str(quantity))
+        # 用 JS 设置输入值并触发 input/change 事件（比 fill() 更可靠）
+        page.evaluate(
+            f"""() => {{
+                const inp = document.querySelector('{input_sel}');
+                if (!inp) return;
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(inp, '{quantity}');
+                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            }}"""
+        )
+        page.wait_for_timeout(150)
+
+        # 滚动到按钮位置再点"售出"
+        btn_el.scroll_into_view_if_needed()
         page.wait_for_timeout(100)
-        # 点击售出
         btn_el.click(timeout=3000)
         log(f"[sell] 点击售出：seed_id={seed_id}, 数量={quantity}")
-        page.wait_for_timeout(300)
 
-        # 如果有确认弹窗，点确认
-        for sel in SELL_CONFIRM_BTNS:
-            try:
-                confirm_btn = page.locator(sel)
-                if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
-                    confirm_btn.first.click(timeout=2000)
-                    log(f"[sell] 确认出售弹窗")
-                    page.wait_for_timeout(200)
-            except Exception:
-                pass
+        # 弹窗确认：点"确认售出"按钮
+        page.wait_for_timeout(300)
+        try:
+            ok_btn = page.locator("#sell-ok-btn")
+            if ok_btn.count() > 0 and ok_btn.first.is_visible():
+                ok_btn.first.click(timeout=3000)
+                log(f"[sell] 点击弹窗确认售出")
+            else:
+                # 备选：找文本包含"确认售出"的按钮
+                alt_btn = page.locator("button:has-text('确认售出')")
+                if alt_btn.count() > 0 and alt_btn.first.is_visible():
+                    alt_btn.first.click(timeout=3000)
+                    log(f"[sell] 点击弹窗确认售出(备选)")
+        except Exception as e:
+            log(f"[sell] 确认弹窗点击异常(可能无弹窗): {e}")
+
+        # 等网络稳定
+        page.wait_for_timeout(500)
 
         return quantity
     except Exception as e:
