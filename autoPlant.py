@@ -41,13 +41,9 @@ PLANT_CONFIRM_BTNS = [
     "button:has-text('确定')",
 ]
 
-# ====== 想种的作物（优先番茄/西红柿，没解锁回退萝卜）======
+# ====== 想种的作物 ======
 SEED_PREFERRED_TEXTS = ["茄子", "🍆"]
 SEED_FALLBACK_TEXTS  = ["玉米", "🌽"]
-#SEED_PREFERRED_TEXTS = ["玉米", "🌽"]
-#SEED_FALLBACK_TEXTS  = ["番茄", "🍅"]
-# SEED_PREFERRED_TEXTS = ["番茄", "🍅"]
-# SEED_FALLBACK_TEXTS  = ["萝卜", "🥕"]
 
 # ====== 调度与行为参数 ======
 SMART_SCHEDULE = True            # True: 按最早成熟时间唤醒；False: 固定间隔
@@ -57,6 +53,14 @@ MIN_WAKE_INTERVAL_SEC = 10
 FALLBACK_INTERVAL_SEC = 300
 HEADLESS = os.getenv("PLANT_HEADLESS", os.getenv("HEADLESS", "true")).lower() != "false"
 OVERRIDE_CONFIRM = True         # 若页面使用原生 window.confirm，置 True 可直接短路为接受
+
+# ====== 出售配置 ======
+SELL_AFTER_HARVEST = True        # 收获后自动出售背包全部作物
+SELL_CONFIRM_BTNS = [
+    "button:has-text('确认')",
+    "button:has-text('确定')",
+    "button:has-text('出售')",
+]
 
 
 # ====== 通用 ======
@@ -91,7 +95,7 @@ def build_storage_state() -> dict:
     }
 
 
-# —— 新增小工具：判断指定地块是否已处于“已种植(.planted)”状态
+# —— 新增小工具：判断指定地块是否已处于"已种植(.planted)"状态
 def is_planted_selector(page, plot_selector: str) -> bool:
     try:
         return bool(page.locator(plot_selector).evaluate("el => el.classList.contains('planted')"))
@@ -171,7 +175,112 @@ def harvest_mature_plots(page):
     page.wait_for_timeout(400)
     return len(mature_selectors)
 
-# ====== 选种：优先番茄/西红柿，未解锁回退萝卜 ======
+# ====== 出售背包作物 ======
+def sell_one_crop(page, seed_id: int, quantity: int = None):
+    """
+    出售指定 seed_id 的作物。
+    - 若 quantity 为 None，则取输入框的 max 值（全部出售）。
+    返回出售的份数，失败返回 0。
+    """
+    input_sel = f'input[data-seed-input="{seed_id}"]'
+    btn_sel  = f'button[data-action="sell"][data-seed-id="{seed_id}"]'
+
+    # 检查元素是否存在
+    input_el = page.locator(input_sel)
+    btn_el  = page.locator(btn_sel)
+    if input_el.count() == 0 or btn_el.count() == 0:
+        log(f"[sell] seed_id={seed_id} 的输入框或按钮不存在，跳过。")
+        return 0
+
+    # 确定数量
+    if quantity is None:
+        try:
+            max_str = input_el.get_attribute("max")
+            quantity = int(max_str) if max_str else 1
+        except (ValueError, TypeError):
+            quantity = 1
+
+    if quantity <= 0:
+        log(f"[sell] seed_id={seed_id} 数量为 0，跳过。")
+        return 0
+
+    try:
+        # 填入数量
+        input_el.fill(str(quantity))
+        page.wait_for_timeout(100)
+        # 点击售出
+        btn_el.click(timeout=3000)
+        log(f"[sell] 点击售出：seed_id={seed_id}, 数量={quantity}")
+        page.wait_for_timeout(300)
+
+        # 如果有确认弹窗，点确认
+        for sel in SELL_CONFIRM_BTNS:
+            try:
+                confirm_btn = page.locator(sel)
+                if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                    confirm_btn.first.click(timeout=2000)
+                    log(f"[sell] 确认出售弹窗")
+                    page.wait_for_timeout(200)
+            except Exception:
+                pass
+
+        return quantity
+    except Exception as e:
+        log(f"[sell] seed_id={seed_id} 出售失败: {e}")
+        return 0
+
+
+def sell_all_inventory(page):
+    """
+    遍历背包，将所有作物全部出售。
+    返回 (总出售种类数, 总售出份数)。
+    """
+    # 找到所有出售按钮，每个按钮对应一种作物
+    sell_btns = page.locator('button[data-action="sell"]')
+    count = sell_btns.count()
+    if count == 0:
+        log("[sell] 背包为空，无需出售。")
+        return (0, 0)
+
+    total_kinds = 0
+    total_qty   = 0
+
+    for i in range(count):
+        btn = sell_btns.nth(i)
+        try:
+            seed_id_str = btn.get_attribute("data-seed-id")
+            if not seed_id_str:
+                continue
+            seed_id = int(seed_id_str)
+
+            # 获取作物名称用于日志
+            # 向上找到 .p-inventory-item，再找 .p-inventory-name
+            name = ""
+            try:
+                item_el = btn.locator("xpath=ancestor::div[contains(@class, 'p-inventory-item')]")
+                name_el = item_el.locator(".p-inventory-name")
+                if name_el.count() > 0:
+                    name = name_el.first.inner_text()
+            except Exception:
+                pass
+
+            qty = sell_one_crop(page, seed_id)
+            if qty > 0:
+                total_kinds += 1
+                total_qty   += qty
+                log(f"[sell] 已出售 {name or f'seed_id={seed_id}'} x{qty}")
+            page.wait_for_timeout(200)
+        except Exception as e:
+            log(f"[sell] 第 {i} 个物品出售异常: {e}")
+
+    if total_kinds > 0:
+        log(f"[sell] 本次共出售 {total_kinds} 种作物，合计 {total_qty} 份。")
+    else:
+        log("[sell] 没有可出售的作物。")
+    return (total_kinds, total_qty)
+
+
+# ====== 选种：优先茄子，未解锁回退玉米 ======
 def pick_seed_locator(page):
     # 只在未锁定的卡片中找
     for t in SEED_PREFERRED_TEXTS:
@@ -197,7 +306,6 @@ def confirm_plant_if_needed(page):
     return False
 
 
-# —— 替换原来的 plant_on_all_empty_slots：先点一次种子，再逐块点空地
 def plant_on_all_empty_slots(page):
     # 1) 空地 = 不是已种(.planted)，也不是购买位/未解锁位
     empty = page.locator(
@@ -212,12 +320,12 @@ def plant_on_all_empty_slots(page):
     empty_keys = []
     for i in range(cnt):
         el = empty.nth(i)
-        empty_keys.append(plot_key_selector(el))  # e.g. .p-plot[data-land="1"][data-plot="3"]
+        empty_keys.append(plot_key_selector(el))
 
-    # 2) 选择种子：优先番茄/西红柿，未解锁则回退萝卜
+    # 2) 选择种子
     seed_loc, which = pick_seed_locator(page)
     if seed_loc is None:
-        log("❌ 没有可用的种子（番茄未解锁且无可用回退）。")
+        log("❌ 没有可用的种子。")
         return 0
 
     try:
@@ -230,7 +338,7 @@ def plant_on_all_empty_slots(page):
     except Exception:
         pass
 
-    # 3) 进入“种植模式”：先点一次种子（如页面在点空地时才弹原生 confirm，也没关系，下面都兜住了）
+    # 3) 进入种植模式：先点一次种子
     try:
         seed_loc.click(timeout=2000)
         log(f"[plant] 进入种植模式（点击种子成功）")
@@ -238,12 +346,11 @@ def plant_on_all_empty_slots(page):
         log(f"[plant] 点击种子失败：{e}")
         return 0
 
-    # 4) 逐块点击空地进行种植；若失败自动重选种子重试一次
+    # 4) 逐块点击空地进行种植
     planted_ok = 0
-    log(f"[plant] 空地 {len(empty_keys)} 块，开始按“种子一次 + 多地块”逻辑种植（{which}）…")
+    log(f"[plant] 空地 {len(empty_keys)} 块，开始种植（{which}）…")
 
     for idx, sel in enumerate(empty_keys, 1):
-        # 如果该地块在过程中已被种上（并发/上一次循环刚种上），就跳过
         if is_planted_selector(page, sel):
             log(f"[plant] {idx}/{len(empty_keys)} 已是 planted，跳过。")
             continue
@@ -251,30 +358,26 @@ def plant_on_all_empty_slots(page):
         def click_plot_once():
             try:
                 page.locator(sel).click(timeout=2000)
-                log(f"[plant] 进入种植模式（点击空地成功）")
-                page.wait_for_timeout(150)  # 给 DOM 一口气
+                page.wait_for_timeout(150)
                 return True
             except Exception as e:
                 log(f"[plant] 点击空地失败（{sel}）：{e}")
                 return False
 
-        # 第一次尝试
         ok = click_plot_once()
-
         if ok:
             planted_ok += 1
             log(f"[plant] {idx}/{len(empty_keys)} ✅ done")
         else:
-            log(f"[plant] {idx}/{len(empty_keys)} ❌ 未能种上（已重试）")
+            log(f"[plant] {idx}/{len(empty_keys)} ❌ 未能种上")
 
         page.wait_for_timeout(150)
 
-    # 5) 落定
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(300)
     return planted_ok
 
-# ====== 单次执行：收获成熟 → 种番茄（或回退） → 计算下次时间 ======
+# ====== 单次执行：收获 → 出售 → 补种 → 计算下次时间 ======
 def run_once():
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -300,6 +403,16 @@ def run_once():
             log("⚠️ 农场根元素未出现，继续尝试…")
 
         harvested = harvest_mature_plots(page)
+
+        # —— 收获后自动出售 ——
+        if SELL_AFTER_HARVEST:
+            log("[sell] 收获完成，开始出售背包作物…")
+            try:
+                sold_kinds, sold_qty = sell_all_inventory(page)
+                log(f"[sell] 出售完成：{sold_kinds} 种，{sold_qty} 份")
+            except Exception as e:
+                log(f"[sell] 出售过程异常: {e}")
+
         planted = plant_on_all_empty_slots(page)
 
         next_ts = get_next_harvest_ts(page)
@@ -341,9 +454,40 @@ def loop_fixed():
             log(f"[loop-fixed] 异常：{e}")
         time.sleep(interval)
 
+# ====== 测试入口：单独出售指定 seed_id（跑一次就退出）======
+def run_sell_test(seed_id: int = 4, quantity: int = None):
+    """单独测试出售功能：只打开页面出售指定作物，不收获不补种"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        storage_state = build_storage_state()
+        context = browser.new_context(
+            storage_state=storage_state,
+            viewport={"width": 1280, "height": 800},
+        )
+        if OVERRIDE_CONFIRM:
+            context.add_init_script("() => { window.confirm = () => true; }")
+        page = context.new_page()
+        open_target(page)
+
+        qty = sell_one_crop(page, seed_id, quantity)
+        log(f"[test] 出售 seed_id={seed_id}, 数量={qty if qty else '失败'}")
+        browser.close()
+
+
 if __name__ == "__main__":
-    log("🚀 农场：逐块收获 + 直接点种子补种（番茄优先）启动…")
-    if SMART_SCHEDULE:
-        loop_smart()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "sell-test":
+        # python plant.py sell-test [seed_id] [quantity]
+        sid = int(sys.argv[2]) if len(sys.argv) > 2 else 4
+        q   = int(sys.argv[3]) if len(sys.argv) > 3 else None
+        log(f"🧪 单独出售测试：seed_id={sid}, quantity={q or '全部'}")
+        run_sell_test(sid, q)
     else:
-        loop_fixed()
+        log("🚀 农场：收获 + 自动出售 + 补种启动…")
+        if SMART_SCHEDULE:
+            loop_smart()
+        else:
+            loop_fixed()
