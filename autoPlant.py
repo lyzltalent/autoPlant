@@ -42,8 +42,8 @@ PLANT_CONFIRM_BTNS = [
 ]
 
 # ====== 想种的作物 ======
-SEED_PREFERRED_TEXTS = ["茄子", "🍆"]
-SEED_FALLBACK_TEXTS  = ["玉米", "🌽"]
+SEED_PREFERRED_TEXTS = ["蘑菇", "🍄"]
+SEED_FALLBACK_TEXTS  = ["茄子", "🍆"]
 
 # ====== 调度与行为参数 ======
 SMART_SCHEDULE = True            # True: 按最早成熟时间唤醒；False: 固定间隔
